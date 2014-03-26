@@ -1,57 +1,151 @@
 #!/usr/bin/env perl
 
+=head1 NAME
+
+ucsc-to-json.pl - format JBrowse JSON from a UCSC database dump
+
+=head1 USAGE
+
+  ucsc-to-json.pl                                    \
+      --in <database dump dir>                       \
+      [ --out <output directory> ]                   \
+      [ --track <table name> ]                       \
+      [ --cssClass <class> ]                         \
+      [ --primaryName <name column> ]                \
+      [ --arrowheadClass <class> ]                   \
+      [ --subfeatureClasses <subfeature class map> ] \
+      [ --clientConfig <JSON client config> ]        \
+      [ --nclChunk <NCL chunk size in bytes> ]       \
+      [ --compress ]                                 \
+      [ --sortMem <sort memory size> ]
+
+=head1 OPTIONS
+
+=over 4
+
+=item --in <dir>
+
+directory containing the UCSC database dump (lots of .txt.gz and .sql files)
+
+=item --out <dir>
+
+output directory for JSON, defaults to "data/"
+
+=item --track 'trackName'
+
+name of the database table, e.g., "knownGene"
+
+=item --primaryName 'name2'
+
+name of the UCSC data column (e.g. "name2" in the case of the UCSC
+"refGene" track) to use as the primary name of features in the JBrowse
+display.  If this is set, the primaryName field will be swapped with
+the name field in the output.  For example, C<--primaryName 'name2'>
+will cause the output's C<name> to be the UCSC C<name2>, and C<name2>
+will be the UCSC C<name>.
+
+=item --cssClass 'classname'
+
+CSS class to use for features in this track, defaults to "basic"
+
+=item --arrowheadClass 'classname'
+
+CSS class for arrowheads, e.g., "transcript-arrowhead"
+
+=item --subfeatureClasses '{ JSON }'
+
+CSS classes for each subfeature type, in JSON syntax, e.g.
+
+  '{"CDS": "transcript-CDS", "exon": "transcript-exon"}'
+
+=item --clientConfig '{ JSON }'
+
+extra configuration for the client, in JSON syntax, e.g.
+
+  '{"featureCss": "background-color: #668; height: 8px;", "histScale": 2}'
+
+For historical reasons, this is only merged into the C<style> section of the new track's configuration.
+
+=item --nclChunk <size in bp>
+
+Size of the individual Nested Containment List chunks. Default 50,000
+bp.
+
+=item --compress
+
+If passed, compress the output with gzip, making .jsonz files.  This
+can save a lot of disk space on the server, but serving these files to
+JBrowse requires some web server configuration.
+
+=item --sortMem <bytes>
+
+The amount of RAM in bytes to use for sorting.
+
+=item --help | -h | -?
+
+Display a help screen.
+
+=item --quiet | -q
+
+Do not print progress messages.
+
+=back
+
+=head1 EXAMPLE
+
+  # format the 'knownGene' track from an hg19 dump from UCSC
+  ucsc-to-json.pl --in path/to/hg19/database/ --track 'knownGene'             \
+      --cssclass transcript                                                   \
+      --subfeatureClasses '{"CDS":"transcript-CDS", "UTR": "transcript-UTR"}' \
+      --arrowheadClass transcript-arrowhead
+
+=cut
+
 use strict;
 use warnings;
 
 use FindBin qw($Bin);
-use lib "$Bin/../lib";
+use lib "$Bin/../src/perl5";
+use JBlibs;
 
-#use IO::Uncompress::Gunzip qw($GunzipError);
-use PerlIO::gzip;
+use Pod::Usage;
 use Getopt::Long;
 use List::Util qw(min max);
-use JSON 2;
-use JsonGenerator;
+use List::MoreUtils 'distinct';
+
+use PerlIO::gzip;
+use Bio::JBrowse::JSON;
+use GenomeDB;
 use NameHandler;
-use ExternalSorter;
+use Bio::JBrowse::ExternalSorter;
 
 my $trackdb = "trackDb";
 my ($indir, $tracks, $arrowheadClass, $subfeatureClasses, $clientConfig, $db,
     $nclChunk, $compress);
 my $outdir = "data";
 my $cssClass = "basic";
+my $primaryNameColumn = 'name';
 my $sortMem = 1024 * 1024 * 512;
-GetOptions("in=s" => \$indir,
-           "out=s" => \$outdir,
-           "track=s@" => \$tracks,
-           "cssClass=s", \$cssClass,
-           "arrowheadClass=s", \$arrowheadClass,
-           "subfeatureClasses=s", \$subfeatureClasses,
-           "clientConfig=s", \$clientConfig,
-           "nclChunk=i" => \$nclChunk,
-           "compress" => \$compress,
-           "sortMem=i" =>\$sortMem);
+my $help;
+my $quiet;
+GetOptions(
+    "in=s"                => \$indir,
+    "out=s"               => \$outdir,
+    "track=s@"            => \$tracks,
+    "cssClass=s"          => \$cssClass,
+    "arrowheadClass=s"    => \$arrowheadClass,
+    "subfeatureClasses=s" => \$subfeatureClasses,
+    "clientConfig=s"      => \$clientConfig,
+    "nclChunk=i"          => \$nclChunk,
+    "primaryName=s"       => \$primaryNameColumn,
+    "compress"            => \$compress,
+    "sortMem=i"           => \$sortMem,
+    "help|?|h"            => \$help,
+    "q|quiet"             => \$quiet,
+) or pod2usage();
 
-if (!defined($indir)) {
-    print <<HELP;
-USAGE: $0 --in <database dump dir> [--out <output directory] [--track <table name>] [--cssClass <class>] [--arrowheadClass <class>] [--subfeatureClasses <subfeature class map>] [--clientConfig <JSON client config>] [--nclChunk <NCL chunk size in bytes>] [--compress] [--sortMem <sort memory size>]
-
-    --in: directory containing the UCSC database dump (lots of .txt.gz and .sql files)
-    --out: defaults to "data"
-    --track: name of the database table, e.g., "knownGene"
-    --cssClass: defaults to "basic"
-    --arrowheadClass: CSS class for arrowheads, e.g., "transcript-arrowhead"
-    --subfeatureClasses: CSS classes for each subfeature type, in JSON syntax
-        e.g. '{"CDS": "transcript-CDS", "exon": "transcript-exon"}'
-    --clientConfig: extra configuration for the client, in JSON syntax
-        e.g. '{"featureCss": "background-color: #668; height: 8px;", "histScale": 2}'
-    --nclChunk: size of the individual NCL chunks
-    --compress: compress the output (requires some web server configuration)
-    --sortMem: the amount of memory in bytes to use for sorting
-HELP
-
-    exit(1);
-}
+pod2usage( -verbose => 2 ) if $help;
+pod2usage() unless defined $indir;
 
 if (!defined($nclChunk)) {
     # default chunk size is 50KiB
@@ -61,22 +155,12 @@ if (!defined($nclChunk)) {
     $nclChunk *= 4 if $compress;
 }
 
-my $trackRel = "tracks";
-my $trackDir = "$outdir/$trackRel";
-mkdir($outdir) unless (-d $outdir);
-mkdir($trackDir) unless (-d $trackDir);
-
-my %refSeqs =
-    map {
-        $_->{name} => $_
-    } @{JsonGenerator::readJSON("$outdir/refSeqs.js", [], 1)};
-
 # the jbrowse NCList code requires that "start" and "end" be
 # the first and second fields in the array; @defaultHeaders and %typeMaps
 # are used to take the fields from the database and put them
 # into the order specified by @defaultHeaders
 
-my @defaultHeaders = ("start", "end", "strand", "name", "score", "itemRgb");
+my @defaultHeaders = ("Start", "End", "Strand", "Name", "Score", "itemRgb");
 my %typeMaps =
     (
         "genePred" =>
@@ -85,7 +169,7 @@ my %typeMaps =
             ["chromStart", "chromEnd", "strand", "name", "score", "itemRgb"]
         );
 
-my @subfeatHeaders = ("start", "end", "strand", "type");
+my @subfeatHeaders = ("Start", "End", "Strand", "Type");
 
 my %skipFields = ("bin" => 1,
                   "chrom" => 1,
@@ -96,76 +180,94 @@ my %skipFields = ("bin" => 1,
                   "exonEnds" => 1,
                   "blockCount" => 1,
                   "blockSizes" => 1,
-                  "blockStarts" => 1);
-
-my %defaultStyle = ("class" => $cssClass);
+                  "blockStarts" => 1,
+                  "thickStart" => 1,
+                  "chromStarts" => 1,
+                  "thickEnd" => 1);
 
 foreach my $tableName (@$tracks) {
     my %trackdbCols = name2column_map($indir . "/" . $trackdb);
     my $tableNameCol = $trackdbCols{tableName};
     my $trackRows = selectall($indir . "/" . $trackdb,
                               sub { $_[0]->[$tableNameCol] eq $tableName });
-    my $track = arrayref2hash($trackRows->[0], \%trackdbCols);
-    my @settingList = split("\n", $track->{settings});
+    if( ! $trackRows->[0] ) {
+        die "Track $tableName not found in the UCSC track database ($trackdb.txt.gz) file.  Is it a real UCSC track?";
+    }
+    my $trackMeta = arrayref2hash($trackRows->[0], \%trackdbCols);
+    my @settingList = split("\n", $trackMeta->{settings});
     my %trackSettings = map {split(" ", $_, 2)} @settingList;
-    $defaultStyle{subfeature_classes} = JSON::from_json($subfeatureClasses)
-        if defined($subfeatureClasses);
-    $defaultStyle{arrowheadClass} = $arrowheadClass if defined($arrowheadClass);
-    $defaultStyle{clientConfig} = JSON::from_json($clientConfig)
-        if defined($clientConfig);
 
-    my @types = split(" ", $track->{type});
+    my @types = split(" ", $trackMeta->{type});
     my $type = $types[0];
-    die "type $type not implemented" unless exists($typeMaps{$type});
+    $typeMaps{$type}
+        or die "Cannot convert $tableName track; this script is not capable of handling $type tracks.\n";
 
-    my %style = (
-        %defaultStyle,
-        "key" => $track->{shortLabel}
-    );
+    # check that we have the data files for that track
+    unless( -f "$indir/$tableName.sql" && -f "$indir/$tableName.txt.gz" ) {
+        die "To format the $tableName track, you must have both files $indir/$tableName.sql and $indir/$tableName.txt.gz\n";
+    }
 
-    my %fields = name2column_map($indir . "/" . $track->{tableName});
-
-    my ($converter, $headers, $subfeatures) = makeConverter(\%fields, $type);
+    my %fields = name2column_map($indir . "/" . $trackMeta->{tableName});
+    my ($converter, $headers, $subfeatures) = makeConverter(\%fields, $type, $primaryNameColumn);
 
     my $color = sprintf("#%02x%02x%02x",
-                        $track->{colorR},
-                        $track->{colorG},
-                        $track->{colorB});
+                        $trackMeta->{colorR},
+                        $trackMeta->{colorG},
+                        $trackMeta->{colorB});
+
+    my $trackConfig =
+      {
+       compress => $compress,
+       style => {
+                 "className" => $cssClass,
+                 "featureCss" => "background-color: $color; height: 6px;",
+                 "histCss" => "background-color: $color;"
+                }
+      };
+
+    my $json = Bio::JBrowse::JSON->new;
+    $trackConfig->{style}->{subfeatureClasses} =
+       $json->decode( $subfeatureClasses )
+       if defined($subfeatureClasses);
+    $trackConfig->{style}->{arrowheadClass} = $arrowheadClass
+      if defined($arrowheadClass);
+    $trackConfig->{style} = {
+                             %{$trackConfig->{style}},
+                             # TODO: break out legacy combined config
+                             $json->decode($clientConfig)
+                            }
+        if defined($clientConfig);
 
     if ($subfeatures) {
-        $style{subfeatureHeaders} = \@subfeatHeaders;
-        $style{class} = "generic_parent";
-        $style{clientConfig}->{featureCallback} = <<ENDJS;
-function(feat, fields, div) {
-    if (fields.type) {
-        div.className = "basic";
-        switch (feat[fields.type]) {
+        $trackConfig->{style}->{className} = "generic_parent";
+        $trackConfig->{style}->{histCss} = "background-color: $color;";
+        $trackConfig->{hooks}->{modify} = <<ENDJS;
+function(track, feat, elem) {
+    var fType = feat.get("Type");
+    if (fType) {
+        elem.className = "basic";
+        switch (fType) {
         case "CDS":
         case "thick":
-            div.style.height = "10px";
-            div.style.marginTop = "-3px";
+            elem.style.height = "10px";
+            elem.style.marginTop = "-3px";
             break;
         case "UTR":
         case "thin":
-            div.style.height = "6px";
-            div.style.marginTop = "-1px";
+            elem.style.height = "6px";
+            elem.style.marginTop = "-1px";
             break;
         }
-        div.style.backgroundColor = "$color";
+        elem.style.backgroundColor = "$color";
     }
 }
 ENDJS
-    } else {
-        $style{clientConfig} = {
-            "featureCss" => "background-color: $color; height: 8px;",
-            "histCss" => "background-color: $color;"
-        };
     }
 
     my $chromCol = $fields{chrom};
     my $startCol = $fields{txStart} || $fields{chromStart};
     my $endCol = $fields{txEnd} || $fields{chromEnd};
-    my $nameCol = $fields{name};
+    my @nameCols = grep defined, distinct( $fields{ $primaryNameColumn }, @fields{grep /^(name|id|alias)\d*$/i, keys %fields} );
     my $compare = sub ($$) {
         $_[0]->[$chromCol] cmp $_[1]->[$chromCol]
             ||
@@ -175,8 +277,8 @@ ENDJS
     };
 
     my %chromCounts;
-    my $sorter = ExternalSorter->new($compare, $sortMem);
-    for_columns("$indir/" . $track->{tableName},
+    my $sorter = Bio::JBrowse::ExternalSorter->new($compare, $sortMem);
+    for_columns("$indir/" . $trackMeta->{tableName},
                 sub { 
                     $chromCounts{$_[0]->[$chromCol]} += 1;
                     $sorter->add($_[0]);
@@ -184,7 +286,13 @@ ENDJS
     $sorter->finish();
 
     my $curChrom;
-    my $jsonGen;
+    my $gdb = GenomeDB->new($outdir);
+    my $track = $gdb->getTrack($tableName, $trackConfig, $trackConfig->{shortLabel} );
+    unless (defined($track)) {
+        $track = $gdb->createFeatureTrack($tableName,
+                                          $trackConfig,
+                                          $trackConfig->{shortLabel});
+    }
     my $nameHandler;
     while (1) {
         my $row = $sorter->get();
@@ -194,61 +302,49 @@ ENDJS
         # a new JsonGenerator at the beginning (!defined($curChrom)) and at
         # every refseq transition ($curChrom ne $row->[$chromCol]) thereafter.
         # We also need to finish the last refseq at the end (!defined($row)).
-        if ((!defined($row))
-                || (!defined($curChrom))
-                    || ($curChrom ne $row->[$chromCol])) {
-            if ($jsonGen && $jsonGen->hasFeatures && $refSeqs{$curChrom}) {
-                print STDERR "working on $curChrom\n";
-                $nameHandler->finish();
-                $jsonGen->generateTrack();
+        if ( !defined $row
+             || !defined $curChrom
+             || $curChrom ne $row->[$chromCol]
+           ) {
+            if ( $track->hasFeatures ) {
+                print STDERR "working on $curChrom\n" unless $quiet;
+                $track->finishLoad;
             }
 
-            if (defined($row)) {
+            if( defined $row ) {
                 $curChrom = $row->[$chromCol];
-                next unless defined($refSeqs{$curChrom});
-                mkdir("$trackDir/" . $curChrom)
-                    unless (-d "$trackDir/" . $curChrom);
-                my $trackDirForChrom = 
-                    sub { "$trackDir/" . $_[0] . "/" . $tableName; };
-                $nameHandler = NameHandler->new($trackDirForChrom);
-                $jsonGen = JsonGenerator->new("$trackDir/$curChrom/"
-                                              . $tableName,
-                                              $nclChunk,
-                                              $compress, $tableName,
-                                              $curChrom,
-                                              $refSeqs{$curChrom}->{start},
-                                              $refSeqs{$curChrom}->{end},
-                                              \%style, $headers,
-                                              \@subfeatHeaders,
-                                              $chromCounts{$curChrom});
+                $track->startLoad($curChrom, $nclChunk,
+                                  [
+                                   {
+                                      attributes => $headers,
+                                      isArrayAttr => {Subfeatures => 1}
+                                   },
+                                   {
+                                       attributes => \@subfeatHeaders,
+                                       isArrayAttr => {}
+                                   },
+                                  ],
+                                 );
             } else {
                 last;
             }
         }
-        next unless defined($refSeqs{$curChrom});
         my $jsonRow = $converter->($row, \%fields, $type);
-        $jsonGen->addFeature($jsonRow);
-        if (defined $nameCol) {
-            $nameHandler->addName([ [$row->[$nameCol]],
-                                    $tableName,
-                                    $row->[$nameCol],
-                                    $row->[$chromCol],
-                                    $jsonRow->[0],
-                                    $jsonRow->[1],
-                                    $row->[$nameCol] ]);
+        $track->addSorted($jsonRow);
+        if ( @nameCols ) {
+            $track->nameHandler->addName(
+                [ [ @{$row}[@nameCols] ], # all the names
+                  $tableName,             # track name
+                  $row->[$nameCols[0]],   # the primary feature name
+                  $row->[$chromCol],      # location refseq
+                  $jsonRow->[1],          # location start
+                  $jsonRow->[2]           # location end
+                ]
+            );
         }
     }
 
-    my $ext = ($compress ? "jsonz" : "json");
-    JsonGenerator::writeTrackEntry("$outdir/trackInfo.js",
-                                   {
-                                       'label' => $tableName,
-                                       'key' => $style{"key"},
-                                       'url' => "$trackRel/{refseq}/"
-                                           . $tableName
-                                           . "/trackData.$ext",
-                                           'type' => "FeatureTrack",
-                                   });
+    $gdb->writeTrackEntry($track);
 }
 
 sub calcSizes {
@@ -291,8 +387,13 @@ sub makeConverter {
     # into an array ready for adding to a JsonGenerator,
     # and a reference to an array of header strings that
     # describe the arrays returned by the sub
-    my ($orig_fields, $type) = @_;
+    my ($orig_fields, $type, $primaryNameColumn) = @_;
     my %fields = (%$orig_fields);
+
+    if( $fields{name} && $fields{ $primaryNameColumn } && $fields{$primaryNameColumn} != $fields{name} ) {
+        ( $fields{name}, $fields{$primaryNameColumn} ) = ( $fields{$primaryNameColumn}, $fields{name} );
+    }
+
     my @headers;
     my $srcMap = $typeMaps{$type};
     my @indexMap;
@@ -314,19 +415,22 @@ sub makeConverter {
     }
 
     my $destIndices = indexHash(@headers);
-    my $strandIndex = $destIndices->{strand};
+    my $strandIndex =
+      defined($destIndices->{Strand}) ? $destIndices->{Strand} + 1 : undef;
+    my $startIndex = $destIndices->{Start} + 1;
+    my $endIndex = $destIndices->{End} + 1;
 
     my $extraProcessing;
     my $subfeatures;
     if (exists($fields{thickStart})) {
-        push @headers, "subfeatures";
-        my $subIndex = $#headers;
+        push @headers, "Subfeatures";
+        my $subIndex = $#headers + 1;
         $subfeatures = 1;
         $extraProcessing = sub {
             my ($dest, $src) = @_;
             $dest->[$subIndex] =
                 makeSubfeatures(maybeIndex($dest, $strandIndex),
-                                $dest->[0], $dest->[1],
+                                $dest->[$startIndex], $dest->[$endIndex],
                                 maybeIndex($src, $fields{blockCount}),
                                 splitNums($src, $fields{chromStarts}),
                                 splitNums($src, $fields{blockSizes}),
@@ -335,16 +439,16 @@ sub makeConverter {
                                 "thin", "thick");
         }
     } elsif (exists($fields{cdsStart})) {
-        push @headers, "subfeatures";
-        my $subIndex = $#headers;
+        push @headers, "Subfeatures";
+        my $subIndex = $#headers + 1;
         $subfeatures = 1;
         $extraProcessing = sub {
             my ($dest, $src) = @_;
             $dest->[$subIndex] =
                 makeSubfeatures(maybeIndex($dest, $strandIndex),
-                                $dest->[0], $dest->[1],
+                                $dest->[$startIndex], $dest->[$endIndex],
                                 maybeIndex($src, $fields{exonCount}),
-                                abs2rel($dest->[0], splitNums($src, $fields{exonStarts})),
+                                abs2rel($dest->[$startIndex], splitNums($src, $fields{exonStarts})),
                                 calcSizes(splitNums($src, $fields{exonStarts}),
                                           splitNums($src, $fields{exonEnds})),
                                 maybeIndex($src, $fields{cdsStart}),
@@ -358,11 +462,13 @@ sub makeConverter {
 
     my $converter = sub {
         my ($row) = @_;
-        # copy fields that we're keeping into the array that we're keeping
-        my $result = [@{$row}[@indexMap]];
+        # Copy fields that we're keeping into the array that we're keeping.
+        # The 0 is because the top-level features use the 0th class in the
+        # "classes" array.
+        my $result = [(0, @{$row}[@indexMap])];
         # make sure start/end are numeric
-        $result->[0] = int($result->[0]);
-        $result->[1] = int($result->[1]);
+        $result->[$startIndex] = int($result->[$startIndex]);
+        $result->[$endIndex] = int($result->[$endIndex]);
         if (defined $strandIndex) {
             $result->[$strandIndex] =
                 defined($result->[$strandIndex]) ?
@@ -402,7 +508,10 @@ sub makeSubfeatures {
                 #add a thin subfeature if this block extends
                 # left of the thick zone
                 if ($abs_block_start < $thick_start) {
-                    push @subfeatures, [$abs_block_start,
+                    # the 1 is because the subfeatures will use the 1st
+                    # index in the "classes" array
+                    push @subfeatures, [1,
+                                        $abs_block_start,
                                         min($thick_start, $abs_block_end),
                                         $parent_strand,
                                         $thin_type];
@@ -411,7 +520,10 @@ sub makeSubfeatures {
                 #add a thick subfeature if this block overlaps the thick zone
                 if (($abs_block_start < $thick_end)
                         && ($abs_block_end > $thick_start)) {
-                    push @subfeatures, [max($thick_start, $abs_block_start),
+                    # the 1 is because the subfeatures will use the 1st
+                    # index in the "classes" array
+                    push @subfeatures, [1,
+                                        max($thick_start, $abs_block_start),
                                         min($thick_end, $abs_block_end),
                                         $parent_strand,
                                         $thick_type];
@@ -420,7 +532,10 @@ sub makeSubfeatures {
                 #add a thin subfeature if this block extends
                 #right of the thick zone
                 if ($abs_block_end > $thick_end) {
-                    push @subfeatures, [max($abs_block_start, $thick_end),
+                    # the 1 is because the subfeatures will use the 1st
+                    # index in the "classes" array
+                    push @subfeatures, [1,
+                                        max($abs_block_start, $thick_end),
                                         $abs_block_end,
                                         $parent_strand,
                                         $thin_type];
@@ -428,7 +543,10 @@ sub makeSubfeatures {
             }
         }
     } else {
-        push @subfeatures, [$thick_start,
+        # the 1 is because the subfeatures will use the 1st
+        # index in the "classes" array
+        push @subfeatures, [1,
+                            $thick_start,
                             $thick_end,
                             $parent_strand,
                             $thick_type];
@@ -464,7 +582,7 @@ sub name2column_map {
     my @cols;
     local *SQL;
     local $_;
-    open SQL, "<$sqlfile" or die "$sqlfile: $!";
+    open SQL, "<$sqlfile" or die "$! reading $sqlfile";
     while (<SQL>) { last if /CREATE TABLE/ }
     while (<SQL>) {
 	last if /^\)/;
